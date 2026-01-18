@@ -74,7 +74,9 @@ class Database:
         await self.run_migration()
 
     async def run_migration(self):
+        """Run category system migration with improved path handling."""
         async with aiosqlite.connect(self.db_name) as db:
+            # Check if migration already applied
             async with db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='category_configs'"
             ) as cursor:
@@ -83,14 +85,35 @@ class Database:
                     return
             
             try:
-                migration_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'migrations', 'migration_001_category_system.sql')
-                if not os.path.exists(migration_path):
-                     migration_path = "PEPPER/migrations/migration_001_category_system.sql"
+                base_dir = os.path.dirname(os.path.dirname(__file__))
+                possible_paths = [
+                    os.path.join(base_dir, 'migrations', 'migration_001_category_system.sql'),
+                    os.path.join(base_dir, '..', 'migrations', 'migration_001_category_system.sql'),
+                    os.path.join(os.getcwd(), 'migrations', 'migration_001_category_system.sql'),
+                    'migrations/migration_001_category_system.sql',
+                    './migration_001_category_system.sql',
+                ]
+                
+                migration_path = None
+                for path in possible_paths:
+                    if os.path.exists(path):
+                        migration_path = path
+                        logger.info(f"Found migration file at: {path}")
+                        break
+                
+                if not migration_path:
+                    logger.error(f"Migration file not found! Searched paths: {possible_paths}")
+                    raise FileNotFoundError(
+                        "Migration file migration_001_category_system.sql not found. "
+                        "Please ensure it's in the migrations/ directory."
+                    )
 
-                with open(migration_path, 'r') as f:
+                with open(migration_path, 'r', encoding='utf-8') as f:
                     migration_sql = f.read()
+                
                 await db.executescript(migration_sql)
                 logger.info("Successfully applied category system migration")
+                
             except Exception as e:
                 logger.error(f"Migration failed: {e}", exc_info=True)
                 raise
@@ -112,11 +135,15 @@ class Database:
                 return await cursor.fetchone() is not None
 
     async def cleanup_old_deals(self, days=30):
+        """Clean up old sent deals to prevent database bloat."""
         async with aiosqlite.connect(self.db_name) as db:
-            await db.execute(
+            cursor = await db.execute(
                 "DELETE FROM sent_deals WHERE sent_at < datetime('now', ?)", (f"-{days} days",)
             )
+            deleted = cursor.rowcount
             await db.commit()
+            logger.info(f"Cleaned up {deleted} old sent deals (older than {days} days)")
+            return deleted
 
     async def add_alert(self, user_id: int, query: str, max_price: Optional[float] = None) -> bool:
         """Adds or updates an alert."""
@@ -325,12 +352,16 @@ class Database:
             await db.commit()
 
     async def cleanup_category_deals(self, days: int = 30):
+        """Clean up old category sent deals to prevent database bloat."""
         async with aiosqlite.connect(self.db_name) as db:
-            await db.execute(
+            cursor = await db.execute(
                 "DELETE FROM category_sent_deals WHERE sent_at < datetime('now', ?)",
                 (f"-{days} days",),
             )
+            deleted = cursor.rowcount
             await db.commit()
+            logger.info(f"Cleaned up {deleted} old category deals (older than {days} days)")
+            return deleted
 
     async def update_category_stats(self, category_id: int, deals_found: int, deals_sent: int, errors: int = 0):
         async with aiosqlite.connect(self.db_name) as db:

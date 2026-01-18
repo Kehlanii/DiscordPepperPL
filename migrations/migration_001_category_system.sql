@@ -1,6 +1,5 @@
 BEGIN TRANSACTION;
 
--- Create new tables
 CREATE TABLE IF NOT EXISTS category_configs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id INTEGER NOT NULL,
@@ -38,16 +37,21 @@ CREATE TABLE IF NOT EXISTS category_stats (
     PRIMARY KEY(category_id, date)
 );
 
--- Create indexes
 CREATE INDEX IF NOT EXISTS idx_category_guild_id ON category_configs(guild_id);
 CREATE INDEX IF NOT EXISTS idx_category_status ON category_configs(status) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS idx_category_guild_active ON category_configs(guild_id, status);
 CREATE INDEX IF NOT EXISTS idx_category_slug ON category_configs(guild_id, slug);
+
+CREATE INDEX IF NOT EXISTS idx_category_schedule 
+ON category_configs(status, schedule_type, schedule_time) 
+WHERE status = 'active';
+
 CREATE INDEX IF NOT EXISTS idx_category_sent_lookup ON category_sent_deals(category_id, deal_id);
 CREATE INDEX IF NOT EXISTS idx_category_sent_time ON category_sent_deals(sent_at);
+
+
 CREATE INDEX IF NOT EXISTS idx_category_stats_date ON category_stats(category_id, date);
 
--- Verify existing tables untouched
 SELECT COUNT(*) as sent_deals_intact FROM sent_deals;
 SELECT COUNT(*) as alerts_intact FROM alerts;
 SELECT COUNT(*) as alert_history_intact FROM alert_history;

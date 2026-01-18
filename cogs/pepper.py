@@ -15,6 +15,13 @@ from utils.views import DealPaginator
 
 logger = logging.getLogger("PepperBot.Cogs")
 
+# Configuration constants
+CATEGORY_STAGGER_DELAY = 2
+MAX_DEALS_PER_NOTIFICATION = 10
+MAX_CATEGORIES_PER_GUILD = 20
+CLEANUP_INTERVAL_HOURS = 24
+CLEANUP_DAYS_OLD = 30
+
 
 class PepperCommands(commands.Cog):
     pepperwatch_group = app_commands.Group(
@@ -28,7 +35,6 @@ class PepperCommands(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
-        # self.bot.db is initialized in bot.py
         self.alerts_manager = AlertsManager(self.bot.db)
         self.category_manager = CategoryManager(self.bot.db)
 
@@ -36,15 +42,14 @@ class PepperCommands(commands.Cog):
         self.flight_deals_task.start()
         self.alerts_task.start()
         self.category_notification_task.start()
+        self.cleanup_task.start()
 
     def cog_unload(self):
         self.flight_deals_task.cancel()
         self.alerts_task.cancel()
         self.category_notification_task.cancel()
+        self.cleanup_task.cancel()
 
-    # --- TASKS ---
-
-    # 1. Flight Deals Task (Daily)
     @tasks.loop(time=datetime.time(hour=Config.FLIGHT_SCHEDULE_HOUR, minute=0))
     async def flight_deals_task(self):
         await self.process_flight_deals(manual_trigger=False)
@@ -53,7 +58,6 @@ class PepperCommands(commands.Cog):
     async def before_flight_task(self):
         await self.bot.wait_until_ready()
 
-    # 2. Alerts Watcher Task (Periodic)
     @tasks.loop(minutes=Config.WATCH_INTERVAL_MINUTES)
     async def alerts_task(self):
         await self.process_alerts()
@@ -62,7 +66,6 @@ class PepperCommands(commands.Cog):
     async def before_alerts_task(self):
         await self.bot.wait_until_ready()
 
-    # 3. Category Notification Task
     @tasks.loop(minutes=1)
     async def category_notification_task(self):
         try:
@@ -86,7 +89,7 @@ class PepperCommands(commands.Cog):
             for i, category in enumerate(to_process):
                 try:
                     if i > 0:
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(CATEGORY_STAGGER_DELAY)
                     
                     await self.process_category_notification(category)
                     
@@ -101,6 +104,27 @@ class PepperCommands(commands.Cog):
     
     @category_notification_task.before_loop
     async def before_category_task(self):
+        await self.bot.wait_until_ready()
+    
+    @tasks.loop(hours=CLEANUP_INTERVAL_HOURS)
+    async def cleanup_task(self):
+        """Clean up old deal records to prevent database bloat."""
+        try:
+            logger.info("Running scheduled cleanup task...")
+            
+            deleted_deals = await self.bot.db.cleanup_old_deals(days=CLEANUP_DAYS_OLD)
+
+            deleted_category_deals = await self.bot.db.cleanup_category_deals(days=CLEANUP_DAYS_OLD)
+            
+            logger.info(
+                f"Cleanup complete: {deleted_deals} flight deals, "
+                f"{deleted_category_deals} category deals removed"
+            )
+        except Exception as e:
+            logger.error(f"Error in cleanup task: {e}", exc_info=True)
+    
+    @cleanup_task.before_loop
+    async def before_cleanup_task(self):
         await self.bot.wait_until_ready()
     
     async def process_category_notification(
@@ -122,10 +146,11 @@ class PepperCommands(commands.Cog):
             result = await self.scraper.get_group_deals(category['slug'], limit=20)
             
             if not result['success']:
-                logger.error(f"Failed to scrape {category['slug']}: {result.get('error')}")
+                error_detail = result.get('error', 'Unknown error')
+                logger.error(f"Failed to scrape {category['slug']}: {error_detail}")
                 if interaction:
                     await interaction.followup.send(
-                        f"❌ Error fetching deals: {result.get('error')}", ephemeral=True
+                        "❌ Failed to fetch deals. Please try again later.", ephemeral=True
                     )
                 await self.bot.db.update_category_stats(category['id'], 0, 0, errors=1)
                 return
@@ -175,7 +200,7 @@ class PepperCommands(commands.Cog):
                 return
             
             new_deals.sort(key=lambda x: x.get('temperature', 0), reverse=True)
-            top_deals = new_deals[:10]
+            top_deals = new_deals[:MAX_DEALS_PER_NOTIFICATION]
             
             emoji = self.category_manager.get_category_emoji(category['slug'])
             
@@ -223,7 +248,9 @@ class PepperCommands(commands.Cog):
         except Exception as e:
             logger.error(f"Error in category notification: {e}", exc_info=True)
             if interaction:
-                await interaction.followup.send(f"⚠️ Error: {e}", ephemeral=True)
+                await interaction.followup.send(
+                    "⚠️ An unexpected error occurred. Please try again later.", ephemeral=True
+                )
     
     def _parse_price(self, price_str: Optional[str]) -> float:
         if not price_str:
@@ -246,7 +273,6 @@ class PepperCommands(commands.Cog):
                 deal = notif["deal"]
                 query = notif["query"]
 
-                # Fetch user to send DM
                 user = self.bot.get_user(user_id)
                 if not user:
                     try:
@@ -273,7 +299,6 @@ class PepperCommands(commands.Cog):
                         await user.send(embed=embed)
                         logger.info(f"Sent alert to {user.name} for {query}")
 
-                        # Sleep briefly to avoid rate limits on DMs
                         await asyncio.sleep(0.5)
 
                     except discord.Forbidden:
@@ -324,7 +349,6 @@ class PepperCommands(commands.Cog):
             new_deals = []
             for deal in deals:
                 deal_id = deal["link"]
-                # Check DB if sent
                 is_sent = await self.bot.db.is_deal_sent(deal_id)
 
                 if manual_trigger or not is_sent:
@@ -341,7 +365,7 @@ class PepperCommands(commands.Cog):
                 return
 
             new_deals.sort(key=lambda x: x.get("temperature", 0), reverse=True)
-            top_deals = new_deals[:10]
+            top_deals = new_deals[:MAX_DEALS_PER_NOTIFICATION]
 
             embed = discord.Embed(
                 title=f"✈️ Dzienny Raport Lotniczy - {datetime.date.today()}",
@@ -417,8 +441,6 @@ class PepperCommands(commands.Cog):
             content=f"**{title_success.format(count=len(deals))}**", embed=embed, view=view
         )
 
-    # --- SLASH COMMANDS (Standard) ---
-
     @app_commands.command(name="pepper", description="Szukaj okazji na Pepper.pl")
     @app_commands.describe(query="Czego szukasz? (np. lego, rtx 4070)")
     async def search_pepper(self, interaction: discord.Interaction, query: str):
@@ -484,8 +506,6 @@ class PepperCommands(commands.Cog):
             )
         except Exception as e:
             await interaction.followup.send(f"⚠️ Wystąpił błąd: {e}", ephemeral=True)
-
-    # --- PEPPERWATCH COMMANDS ---
 
     @pepperwatch_group.command(
         name="add", description="Dodaj powiadomienie (np. 'rtx 4070' < 3000)"
@@ -554,8 +574,6 @@ class PepperCommands(commands.Cog):
                 ephemeral=True,
             )
 
-    # --- CATEGORY MANAGEMENT COMMANDS ---
-
     @category_group.command(name="add", description="Add automated category notifications")
     @app_commands.describe(
         slug="Category slug (e.g., podzespoly-komputerowe)",
@@ -593,9 +611,9 @@ class PepperCommands(commands.Cog):
             return
         
         guild_categories = await self.bot.db.get_guild_categories(interaction.guild_id)
-        if len(guild_categories) >= 20:
+        if len(guild_categories) >= MAX_CATEGORIES_PER_GUILD:
             await interaction.followup.send(
-                "❌ Maximum 20 categories per server. Remove some before adding new ones.",
+                f"❌ Maximum {MAX_CATEGORIES_PER_GUILD} categories per server. Remove some before adding new ones.",
                 ephemeral=True
             )
             return
@@ -721,8 +739,6 @@ class PepperCommands(commands.Cog):
                 name += " [PROTECTED]"
             
             embed.add_field(name=name, value=value, inline=False)
-        
-        embed.set_footer(text="Use /category stats <slug> for detailed analytics")
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
     
