@@ -70,6 +70,30 @@ This bot serves as a bridge between the Pepper.pl deal platform and Discord. It 
 
 ## Commands
 
+The bot supports both Slash Commands (modern) and Text Commands (classic, faster).
+
+### Command Reference
+
+| Category | Slash Command | Text Command | Example |
+|----------|---------------|--------------|---------|
+| **Alerts** | `/pepperwatch add` | `p watch:query < price` | `p watch:Rzym < 600` |
+| | `/pepperwatch list` | `p alerts` or `p list` | `p alerts` |
+| | `/pepperwatch remove` | `p unwatch:query` | `p unwatch:Rzym` |
+| **Search** | `/pepper query` | `p query` | `p rtx 4070` |
+| | `/pepperhot` | `p hot` | `p hot` |
+| | `/pepper_group slug` | `p group:slug` | `p group:elektronika` |
+| **Categories** | `/category preview` | `p preview:slug` | `p preview:lego` |
+| | `/category list` | `p cat list` | `p cat list` |
+| | `/category add` | `p cat add:slug ...` | `p cat add:gry daily 09:00 #deals` |
+| | `/category remove` | `p cat rm:slug` | `p cat rm:gry` |
+| | `/category pause` | `p cat pause:slug` | `p cat pause:gry` |
+| | `/category resume` | `p cat resume:slug` | `p cat resume:gry` |
+| | `/category trigger` | `p cat run:slug` | `p cat run:gry` |
+| **Utility** | `/pepperclean` | `p clean [limit]` | `p clean 50` |
+| | `/flynow` | `p fly` | `p fly` |
+
+### Legacy Command List
+
 | Command | Description | Permissions |
 | :--- | :--- | :--- |
 | `/pepper [query]` | Search for deals matching a keyword. | Everyone |

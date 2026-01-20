@@ -2,7 +2,8 @@ import asyncio
 import datetime
 import logging
 from collections import defaultdict
-from typing import Any, Dict, Optional
+from functools import wraps
+from typing import Any, Callable, Dict, Optional, List
 
 import discord
 from discord import app_commands
@@ -21,6 +22,20 @@ MAX_DEALS_PER_NOTIFICATION = 10
 MAX_CATEGORIES_PER_GUILD = 20
 CLEANUP_INTERVAL_HOURS = 24
 CLEANUP_DAYS_OLD = 30
+
+
+def text_command_error_handler(func):
+    @wraps(func)
+    async def wrapper(self, message: discord.Message, *args, **kwargs):
+        try:
+            await func(self, message, *args, **kwargs)
+        except Exception as e:
+            logger.error(f"Error in {func.__name__}: {e}", exc_info=True)
+            try:
+                await message.reply(f"⚠️ Error: {e}", delete_after=10)
+            except:
+                pass
+    return wrapper
 
 
 class PepperCommands(commands.Cog):
@@ -75,10 +90,7 @@ class PepperCommands(commands.Cog):
             
             logger.info(f"Checking {len(categories)} active categories for scheduled runs")
             
-            to_process = []
-            for category in categories:
-                if self.category_manager.should_run_now(category):
-                    to_process.append(category)
+            to_process = [cat for cat in categories if self.category_manager.should_run_now(cat)]
             
             if not to_process:
                 return
@@ -94,9 +106,7 @@ class PepperCommands(commands.Cog):
                     
                 except Exception as e:
                     logger.error(f"Error processing category {category['slug']}: {e}", exc_info=True)
-                    await self.bot.db.update_category_stats(
-                        category['id'], 0, 0, errors=1
-                    )
+                    await self.bot.db.update_category_stats(category['id'], 0, 0, errors=1)
         
         except Exception as e:
             logger.error(f"Error in category notification task: {e}", exc_info=True)
@@ -111,7 +121,6 @@ class PepperCommands(commands.Cog):
             logger.info("Running scheduled cleanup task...")
             
             deleted_deals = await self.bot.db.cleanup_old_deals(days=CLEANUP_DAYS_OLD)
-
             deleted_category_deals = await self.bot.db.cleanup_category_deals(days=CLEANUP_DAYS_OLD)
             
             logger.info(
@@ -124,6 +133,495 @@ class PepperCommands(commands.Cog):
     @cleanup_task.before_loop
     async def before_cleanup_task(self):
         await self.bot.wait_until_ready()
+    
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        if message.author.bot or not message.content.startswith('p '):
+            return
+        
+        content = message.content[2:].strip()
+        if not content:
+            return
+        
+        handlers = {
+            'watch:': lambda: self._handle_watch_command(message, content),
+            'unwatch:': lambda: self._handle_unwatch_command(message, content),
+            'group:': lambda: self._handle_group_command(message, content),
+            'preview:': lambda: self._handle_preview_command(message, content),
+            'cat ': lambda: self._handle_category_command(message, content),
+        }
+        
+        exact_handlers = {
+            'alerts': lambda: self._handle_list_command(message),
+            'list': lambda: self._handle_list_command(message),
+            'hot': lambda: self._handle_hot_command(message),
+            'fly': lambda: self._handle_fly_command(message),
+        }
+        
+        try:
+            if content.startswith('clean'):
+                await self._handle_clean_command(message, content)
+                return
+            
+            for prefix, handler in handlers.items():
+                if content.startswith(prefix):
+                    await handler()
+                    return
+            
+            if content in exact_handlers:
+                await exact_handlers[content]()
+                return
+            
+            await self._handle_search_command(message, content)
+            
+        except Exception as e:
+            logger.error(f"Error in text command handler: {e}", exc_info=True)
+            try:
+                await message.reply(f"⚠️ Error processing command: {e}", delete_after=10)
+            except:
+                pass
+
+    def parse_price_from_text(self, text: str) -> tuple[str, Optional[float], Optional[str]]:
+        for op, op_type in [('<', 'max'), ('>', 'min')]:
+            if op in text:
+                parts = text.split(op, 1)
+                query = parts[0].strip()
+                try:
+                    return query, float(parts[1].strip()), op_type
+                except (ValueError, IndexError):
+                    return query, None, None
+        return text.strip(), None, None
+
+    async def safe_delete_message(self, message: discord.Message):
+        try:
+            await message.delete()
+        except (discord.Forbidden, discord.NotFound):
+            pass
+        except Exception as e:
+            logger.debug(f"Could not delete message: {e}")
+
+    def get_temperature_icon(self, temp: int) -> str:
+        return '🌋' if temp > 500 else ('🔥' if temp > 300 else '❄️')
+
+    async def _add_alert_shared(self, user_id: int, query: str, max_price: Optional[float]) -> tuple[bool, str]:
+        current = await self.alerts_manager.get_alerts(user_id)
+        if len(current) >= 10:
+            return False, "❌ Max 10 alerts. Remove some first."
+        
+        added = await self.alerts_manager.add_alert(user_id, query, max_price)
+        
+        if not added:
+            return False, "⚠️ Error adding alert."
+        
+        msg = f"✅ Watching: **{query}**"
+        if max_price:
+            msg += f" (< {max_price} zł)"
+        msg += "\n🔔 Checking every 15 minutes"
+        return True, msg
+
+    async def _remove_alert_shared(self, user_id: int, query: str) -> tuple[bool, str]:
+        removed = await self.alerts_manager.remove_alert(user_id, query)
+        
+        if removed:
+            return True, f"🗑️ Stopped watching: **{query}**"
+        else:
+            return False, f"⚠️ Alert **{query}** not found.\nUse `p alerts` to see your list."
+
+    def _build_alerts_embed(self, alerts: List[Dict]) -> discord.Embed:
+        embed = discord.Embed(
+            title="🔔 Your Alerts",
+            description="Watching these queries:",
+            color=Config.COLOR_PRIMARY,
+        )
+        
+        for i, a in enumerate(alerts, 1):
+            price_info = f"**< {a['max_price']} zł**" if a["max_price"] else "Any price"
+            embed.add_field(name=f"{i}. {a['query']}", value=f"💰 {price_info}", inline=False)
+        
+        embed.set_footer(text="Use p unwatch:query to remove")
+        return embed
+
+    def _build_category_list_embed(self, categories: List[Dict]) -> discord.Embed:
+        embed = discord.Embed(
+            title="📋 Active Categories",
+            description=f"Managing {len(categories)} automated notifications",
+            color=Config.COLOR_PRIMARY
+        )
+        
+        for i, cat in enumerate(categories, 1):
+            emoji = self.category_manager.get_category_emoji(cat['slug'])
+            
+            filters = []
+            if cat.get('min_temperature', 0) > 0:
+                filters.append(f"🌡️ Min: {cat['min_temperature']}°")
+            if cat.get('max_price'):
+                filters.append(f"💰 Max: {cat['max_price']} zł")
+            
+            filter_str = " | ".join(filters) if filters else "No filters"
+            schedule_str = self.category_manager.format_schedule(cat)
+            status_emoji = "✅" if cat['status'] == 'active' else "⏸️"
+            
+            value = f"{status_emoji} {schedule_str}\n📍 <#{cat['channel_id']}>\n{filter_str}"
+            name = f"{i}. {emoji} {cat['slug']}"
+            
+            embed.add_field(name=name, value=value, inline=False)
+        
+        return embed
+
+    async def _validate_and_create_category(
+        self,
+        guild_id: int,
+        slug: str,
+        channel: discord.TextChannel,
+        frequency: str,
+        time: str,
+        day: Optional[str],
+        date: Optional[int],
+        min_temp: int,
+        max_price: Optional[float]
+    ) -> tuple[bool, Optional[str], Optional[int]]:
+        slug = slug.lower().strip()
+        
+        existing = await self.bot.db.get_category_by_slug(guild_id, slug)
+        if existing:
+            return False, f"⚠️ Category **{slug}** already exists.", None
+        
+        guild_categories = await self.bot.db.get_guild_categories(guild_id)
+        if len(guild_categories) >= MAX_CATEGORIES_PER_GUILD:
+            return False, f"❌ Maximum {MAX_CATEGORIES_PER_GUILD} categories per server.", None
+        
+        valid, error = await self.category_manager.validate_slug(self.scraper, slug)
+        if not valid:
+            return False, error, None
+        
+        valid, error = await self.category_manager.validate_channel_permissions(self.bot, channel)
+        if not valid:
+            return False, error, None
+        
+        valid, schedule, error = await self.category_manager.parse_schedule(frequency, time, day, date)
+        if not valid:
+            return False, error, None
+        
+        category_id = await self.bot.db.add_category_config(
+            guild_id=guild_id,
+            slug=slug,
+            channel_id=channel.id,
+            schedule_type=schedule['type'],
+            schedule_time=schedule['time'],
+            schedule_day=schedule['day'],
+            schedule_date=schedule['date'],
+            min_temperature=min_temp,
+            max_price=max_price
+        )
+        
+        if not category_id:
+            return False, "❌ Database error.", None
+        
+        return True, None, category_id
+
+    @text_command_error_handler
+    async def _handle_watch_command(self, message: discord.Message, content: str):
+        args = content[6:].strip()
+        query, price, price_type = self.parse_price_from_text(args)
+        
+        if not query:
+            await message.reply("❌ Usage: `p watch:query` or `p watch:query < price`", delete_after=10)
+            return
+        
+        max_price = price if price_type == 'max' else None
+        success, msg = await self._add_alert_shared(message.author.id, query, max_price)
+        await message.reply(msg, delete_after=15)
+        await self.safe_delete_message(message)
+
+    @text_command_error_handler
+    async def _handle_unwatch_command(self, message: discord.Message, content: str):
+        query = content[8:].strip()
+        
+        if not query:
+            await message.reply("❌ Usage: `p unwatch:query`", delete_after=10)
+            return
+        
+        success, msg = await self._remove_alert_shared(message.author.id, query)
+        await message.reply(msg, delete_after=10)
+        await self.safe_delete_message(message)
+
+    @text_command_error_handler
+    async def _handle_list_command(self, message: discord.Message):
+        alerts = await self.alerts_manager.get_alerts(message.author.id)
+        
+        if not alerts:
+            await message.reply("🔭 No active alerts.", delete_after=10)
+            await self.safe_delete_message(message)
+            return
+        
+        embed = self._build_alerts_embed(alerts)
+        await message.reply(embed=embed)
+        await self.safe_delete_message(message)
+
+    async def _handle_search_generic(
+        self,
+        message: discord.Message,
+        scraper_method: Callable,
+        method_args: tuple,
+        title_template: str,
+        error_msg: str
+    ):
+        try:
+            result = await scraper_method(*method_args)
+            
+            if not result["success"]:
+                await message.reply(f"❌ Error: {result.get('error', 'Unknown')}", delete_after=10)
+                return
+            
+            deals = result["deals"]
+            if not deals:
+                await message.reply(error_msg, delete_after=10)
+                return
+            
+            view = DealPaginator(deals, message.author)
+            embed = view.get_initial_embed()
+            
+            await message.reply(content=title_template.format(count=len(deals)), embed=embed, view=view)
+            await self.safe_delete_message(message)
+        
+        except Exception as e:
+            logger.error(f"Error in search command: {e}", exc_info=True)
+            await message.reply(f"⚠️ Error: {e}", delete_after=10)
+
+    async def _handle_search_command(self, message: discord.Message, query: str):
+        await self._handle_search_generic(
+            message,
+            self.scraper.search_deals,
+            (query, Config.DEFAULT_SEARCH_LIMIT),
+            f"**🌶️ Found {{count}} deals for: {query}**",
+            f"🤷 No deals found for: **{query}**"
+        )
+
+    async def _handle_hot_command(self, message: discord.Message):
+        await self._handle_search_generic(
+            message,
+            self.scraper.get_hot_deals,
+            (Config.DEFAULT_SEARCH_LIMIT,),
+            "**🔥 Top {count} hot deals!**",
+            "🤷 No hot deals found."
+        )
+
+    async def _handle_group_command(self, message: discord.Message, content: str):
+        slug = content[6:].strip().lower().replace(' ', '-')
+        
+        if not slug:
+            await message.reply("❌ Usage: `p group:slug`", delete_after=10)
+            return
+        
+        await self._handle_search_generic(
+            message,
+            self.scraper.get_group_deals,
+            (slug, Config.DEFAULT_SEARCH_LIMIT),
+            f"**📂 Top {{count}} deals from: {slug}**",
+            f"🤷 No deals in category: **{slug}**"
+        )
+
+    @text_command_error_handler
+    async def _handle_preview_command(self, message: discord.Message, content: str):
+        slug = content[8:].strip().lower()
+        
+        if not slug:
+            await message.reply("❌ Usage: `p preview:slug`", delete_after=10)
+            return
+        
+        result = await self.scraper.get_group_deals(slug, limit=3)
+        
+        if not result['success']:
+            await message.reply(f"❌ Category **{slug}** not found.", delete_after=10)
+            return
+        
+        deals = result['deals']
+        if not deals:
+            await message.reply(f"✅ Category found: **{slug}**\n📭 No deals currently available.", delete_after=15)
+            return
+        
+        embed = discord.Embed(
+            title=f"✅ Preview: {slug}",
+            description=f"Latest {len(deals)} deals:",
+            color=Config.COLOR_SUCCESS
+        )
+        
+        for i, deal in enumerate(deals, 1):
+            temp = deal.get('temperature', 0)
+            icon = self.get_temperature_icon(temp)
+            
+            value = f"💰 {deal.get('price', '???')} | {icon} {temp}° | 🪐 {deal.get('merchant', 'Unknown')}"
+            embed.add_field(
+                name=f"{i}. {deal['title'][:60]}...",
+                value=value,
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Add with: p cat add:{slug} ...")
+        await message.reply(embed=embed, delete_after=30)
+        await self.safe_delete_message(message)
+
+    @text_command_error_handler
+    async def _handle_fly_command(self, message: discord.Message):
+        if not message.author.guild_permissions.administrator:
+            await message.reply("❌ Admin only command.", delete_after=10)
+            return
+        
+        await message.reply("⚡ Triggering flight deals...", delete_after=5)
+        await self.process_flight_deals(manual_trigger=True)
+        await self.safe_delete_message(message)
+
+    @text_command_error_handler
+    async def _handle_clean_command(self, message: discord.Message, content: str):
+        if not message.channel.permissions_for(message.guild.me).manage_messages:
+            await message.reply("❌ Missing 'Manage Messages' permission.", delete_after=10)
+            return
+        
+        parts = content.split()
+        limit = int(parts[1]) if len(parts) > 1 else 20
+        
+        deleted = await message.channel.purge(limit=limit, check=lambda m: m.author == self.bot.user)
+        await message.reply(f"🗑️ Deleted {len(deleted)} messages", delete_after=5)
+        await self.safe_delete_message(message)
+
+    async def _handle_category_command(self, message: discord.Message, content: str):
+        if not message.author.guild_permissions.administrator:
+            await message.reply("❌ Admin only command.", delete_after=10)
+            return
+        
+        cat_content = content[4:].strip()
+        
+        cat_handlers = {
+            'list': lambda: self._handle_cat_list(message),
+            'add:': lambda: self._handle_cat_add(message, cat_content[4:]),
+            'rm:': lambda: self._handle_cat_remove(message, cat_content[3:]),
+            'pause:': lambda: self._handle_cat_status_change(message, cat_content[6:], 'paused'),
+            'resume:': lambda: self._handle_cat_status_change(message, cat_content[7:], 'active'),
+            'run:': lambda: self._handle_cat_trigger(message, cat_content[4:]),
+        }
+        
+        try:
+            if cat_content == 'list':
+                await cat_handlers['list']()
+            else:
+                for prefix, handler in cat_handlers.items():
+                    if cat_content.startswith(prefix) and prefix != 'list':
+                        await handler()
+                        return
+                
+                await message.reply("❌ Usage: `p cat [list|add:slug|rm:slug|pause:slug|resume:slug|run:slug]`", delete_after=10)
+        
+        except Exception as e:
+            logger.error(f"Error in category command: {e}", exc_info=True)
+            await message.reply(f"⚠️ Error: {e}", delete_after=10)
+
+    @text_command_error_handler
+    async def _handle_cat_list(self, message: discord.Message):
+        categories = await self.bot.db.get_guild_categories(message.guild.id)
+        
+        if not categories:
+            await message.reply("📭 No categories configured.\nUse `p cat add:slug ...` to create one!", delete_after=10)
+            await self.safe_delete_message(message)
+            return
+        
+        embed = self._build_category_list_embed(categories)
+        await message.reply(embed=embed)
+        await self.safe_delete_message(message)
+
+    @text_command_error_handler
+    async def _handle_cat_add(self, message: discord.Message, args: str):
+        parts = args.split()
+        if len(parts) < 4:
+            await message.reply("❌ Usage: `p cat add:slug frequency time #channel [day] [min:temp] [max:price]`", delete_after=15)
+            return
+        
+        slug = parts[0].lower().strip()
+        frequency = parts[1].lower()
+        time = parts[2]
+        
+        channel = None
+        for word in parts:
+            if word.startswith('<#') and word.endswith('>'):
+                channel_id = int(word[2:-1])
+                channel = self.bot.get_channel(channel_id)
+                break
+        
+        if not channel:
+            await message.reply("❌ Channel not found. Use #channel mention.", delete_after=10)
+            return
+        
+        day = None
+        date = None
+        min_temp = 0
+        max_price = None
+        
+        for part in parts:
+            if part.startswith('min:'):
+                min_temp = int(part[4:])
+            elif part.startswith('max:'):
+                max_price = float(part[4:])
+            elif part.lower() in ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']:
+                day = part.lower()
+            elif part.isdigit() and 1 <= int(part) <= 31 and frequency == 'monthly':
+                date = int(part)
+        
+        success, error, category_id = await self._validate_and_create_category(
+            message.guild.id, slug, channel, frequency, time, day, date, min_temp, max_price
+        )
+        
+        if not success:
+            await message.reply(error, delete_after=10)
+            return
+        
+        emoji = self.category_manager.get_category_emoji(slug)
+        schedule = {'type': frequency, 'time': time, 'day': day, 'date': date}
+        
+        msg = f"✅ Category added: {emoji} **{slug}**\n"
+        msg += f"📅 {self.category_manager.format_schedule(schedule)}\n"
+        msg += f"📍 {channel.mention}"
+        
+        await message.reply(msg, delete_after=30)
+        await self.safe_delete_message(message)
+
+    @text_command_error_handler
+    async def _handle_cat_remove(self, message: discord.Message, slug: str):
+        slug = slug.strip().lower()
+        
+        if slug == 'bilety-lotnicze':
+            await message.reply("🔒 Cannot remove protected category.", delete_after=10)
+            return
+        
+        removed = await self.bot.db.remove_category_config(message.guild.id, slug)
+        
+        msg = f"🗑️ Removed category: **{slug}**" if removed else f"⚠️ Category **{slug}** not found."
+        await message.reply(msg, delete_after=10)
+        await self.safe_delete_message(message)
+
+    @text_command_error_handler
+    async def _handle_cat_status_change(self, message: discord.Message, slug: str, new_status: str):
+        slug = slug.strip().lower()
+        
+        updated = await self.bot.db.update_category_status(message.guild.id, slug, new_status)
+        
+        status_emoji = "⏸️" if new_status == 'paused' else "▶️"
+        status_text = "Paused" if new_status == 'paused' else "Resumed"
+        
+        msg = f"{status_emoji} {status_text}: **{slug}**" if updated else f"⚠️ Category **{slug}** not found."
+        await message.reply(msg, delete_after=10)
+        await self.safe_delete_message(message)
+
+    @text_command_error_handler
+    async def _handle_cat_trigger(self, message: discord.Message, slug: str):
+        slug = slug.strip().lower()
+        
+        category = await self.bot.db.get_category_by_slug(message.guild.id, slug)
+        if not category:
+            await message.reply(f"⚠️ Category **{slug}** not found.", delete_after=10)
+            return
+        
+        await message.reply(f"⚡ Triggering: **{slug}**...", delete_after=5)
+        await self.process_category_notification(category, manual_trigger=True)
+        await self.safe_delete_message(message)
     
     async def process_category_notification(
         self,
@@ -213,9 +711,7 @@ class PepperCommands(commands.Cog):
                 temp = deal.get('temperature', 0)
                 merchant = deal.get('merchant', 'Unknown')
                 
-                icon = '🔥' if temp > 300 else '❄️'
-                if temp > 500:
-                    icon = '🌋'
+                icon = self.get_temperature_icon(temp)
                 
                 value_str = f"💰 **{price}** | {icon} {temp}° | 🪐 {merchant}\n[🔗 View deal]({deal['link']})"
                 
@@ -267,10 +763,7 @@ class PepperCommands(commands.Cog):
             
             grouped = defaultdict(lambda: defaultdict(list))
             for notif in notifications:
-                user_id = notif["user_id"]
-                query = notif["query"]
-                deal = notif["deal"]
-                grouped[user_id][query].append(deal)
+                grouped[notif["user_id"]][notif["query"]].append(notif["deal"])
             
             for user_id, queries_dict in grouped.items():
                 user = self.bot.get_user(user_id)
@@ -293,9 +786,7 @@ class PepperCommands(commands.Cog):
                         
                         for i, deal in enumerate(top_deals, 1):
                             temp = deal.get('temperature', 0)
-                            icon = '🔥' if temp > 300 else '❄️'
-                            if temp > 500:
-                                icon = '🌋'
+                            icon = self.get_temperature_icon(temp)
                             
                             value = f"💰 **{deal['price']}** | {icon} {temp}°\n[🔗 Zobacz okazję]({deal['link']})"
                             
@@ -391,9 +882,7 @@ class PepperCommands(commands.Cog):
                 temp = deal.get("temperature", 0)
                 merchant = deal.get("merchant", "Unknown")
 
-                icon = "🔥" if temp > 300 else "❄️"
-                if temp > 500:
-                    icon = "🌋"
+                icon = self.get_temperature_icon(temp)
 
                 value_str = f"💰 **{price}** | {icon} {temp}° | 🏪 {merchant}\n[🔗 Zobacz okazję]({deal['link']})"
 
@@ -504,11 +993,8 @@ class PepperCommands(commands.Cog):
     async def clean_pepper(self, interaction: discord.Interaction, limit: int = 20):
         await interaction.response.defer(ephemeral=True)
 
-        def is_me(m):
-            return m.author == self.bot.user
-
         try:
-            deleted = await interaction.channel.purge(limit=limit, check=is_me)
+            deleted = await interaction.channel.purge(limit=limit, check=lambda m: m.author == self.bot.user)
             await interaction.followup.send(
                 f"🗑️ Usunięto {len(deleted)} moich wiadomości (sprawdzono {limit}).", ephemeral=True
             )
@@ -527,24 +1013,8 @@ class PepperCommands(commands.Cog):
         self, interaction: discord.Interaction, query: str, max_price: Optional[float] = None
     ):
         await interaction.response.defer(ephemeral=True)
-
-        current = await self.alerts_manager.get_alerts(interaction.user.id)
-        if len(current) >= 10:
-            await interaction.followup.send(
-                "❌ Masz za dużo aktywnych powiadomień (max 10). Usuń jakieś, aby dodać nowe.",
-                ephemeral=True,
-            )
-            return
-
-        added = await self.alerts_manager.add_alert(interaction.user.id, query, max_price)
-        if added:
-            msg = f"✅ Dodano powiadomienie dla: **{query}**"
-            if max_price:
-                msg += f"\n💰 Maksymalna cena: **{max_price} zł**"
-            msg += "\n🔔 Będę sprawdzać okazje co 15 minut i wyślę Ci prywatną wiadomość."
-            await interaction.followup.send(msg, ephemeral=True)
-        else:
-            await interaction.followup.send("⚠️ Błąd przy dodawaniu powiadomienia.", ephemeral=True)
+        success, msg = await self._add_alert_shared(interaction.user.id, query, max_price)
+        await interaction.followup.send(msg, ephemeral=True)
 
     @pepperwatch_group.command(name="list", description="Pokaż moje aktywne powiadomienia")
     async def pw_list(self, interaction: discord.Interaction):
@@ -555,32 +1025,19 @@ class PepperCommands(commands.Cog):
             )
             return
 
-        embed = discord.Embed(
-            title="🔔 Twoje powiadomienia",
-            description="Lista obserwowanych fraz:",
-            color=Config.COLOR_PRIMARY,
-        )
-
-        for i, a in enumerate(alerts, 1):
-            price_info = f"**< {a['max_price']} zł**" if a["max_price"] else "Każda cena"
-            embed.add_field(name=f"{i}. {a['query']}", value=f"💰 {price_info}", inline=False)
-
+        embed = self._build_alerts_embed(alerts)
         embed.set_footer(text="Użyj /pepperwatch remove [fraza] aby usunąć.")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @pepperwatch_group.command(name="remove", description="Usuń powiadomienie")
     @app_commands.describe(query="Fraza do usunięcia (dokładna nazwa z listy)")
     async def pw_remove(self, interaction: discord.Interaction, query: str):
-        removed = await self.alerts_manager.remove_alert(interaction.user.id, query)
-        if removed:
-            await interaction.response.send_message(
-                f"🗑️ Usunięto powiadomienie dla: **{query}**", ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                f"⚠️ Nie znaleziono powiadomienia dla: **{query}**\nSprawdź listę używając `/pepperwatch list`",
-                ephemeral=True,
-            )
+        success, msg = await self._remove_alert_shared(interaction.user.id, query)
+        
+        if not success:
+            msg = msg.replace("p alerts", "/pepperwatch list")
+        
+        await interaction.response.send_message(msg, ephemeral=True)
 
     @category_group.command(name="add", description="Add automated category notifications")
     @app_commands.describe(
@@ -608,56 +1065,16 @@ class PepperCommands(commands.Cog):
     ):
         await interaction.response.defer(ephemeral=True)
         
-        slug = slug.lower().strip()
-        
-        existing = await self.bot.db.get_category_by_slug(interaction.guild_id, slug)
-        if existing:
-            await interaction.followup.send(
-                f"⚠️ Category **{slug}** already exists. Use `/category edit` to modify.",
-                ephemeral=True
-            )
-            return
-        
-        guild_categories = await self.bot.db.get_guild_categories(interaction.guild_id)
-        if len(guild_categories) >= MAX_CATEGORIES_PER_GUILD:
-            await interaction.followup.send(
-                f"❌ Maximum {MAX_CATEGORIES_PER_GUILD} categories per server. Remove some before adding new ones.",
-                ephemeral=True
-            )
-            return
-        
-        valid, error = await self.category_manager.validate_slug(self.scraper, slug)
-        if not valid:
-            await interaction.followup.send(f"❌ {error}\nUse `/category browse` to find valid categories.", ephemeral=True)
-            return
-        
-        valid, error = await self.category_manager.validate_channel_permissions(self.bot, channel)
-        if not valid:
-            await interaction.followup.send(f"❌ {error}", ephemeral=True)
-            return
-        
-        valid, schedule, error = await self.category_manager.parse_schedule(frequency, time, day, date)
-        if not valid:
-            await interaction.followup.send(f"❌ {error}", ephemeral=True)
-            return
-        
-        category_id = await self.bot.db.add_category_config(
-            guild_id=interaction.guild_id,
-            slug=slug,
-            channel_id=channel.id,
-            schedule_type=schedule['type'],
-            schedule_time=schedule['time'],
-            schedule_day=schedule['day'],
-            schedule_date=schedule['date'],
-            min_temperature=min_temp or 0,
-            max_price=max_price
+        success, error, category_id = await self._validate_and_create_category(
+            interaction.guild_id, slug, channel, frequency, time, day, date, min_temp or 0, max_price
         )
         
-        if not category_id:
-            await interaction.followup.send("❌ Database error. Please try again.", ephemeral=True)
+        if not success:
+            await interaction.followup.send(error, ephemeral=True)
             return
         
         emoji = self.category_manager.get_category_emoji(slug)
+        schedule = {'type': frequency, 'time': time, 'day': day, 'date': date}
         
         embed = discord.Embed(
             title="✅ Category Added Successfully!",
@@ -665,12 +1082,7 @@ class PepperCommands(commands.Cog):
         )
         
         embed.add_field(name="📂 Category", value=f"{emoji} **{slug}**", inline=False)
-        embed.add_field(name="📅 Schedule", value=self.category_manager.format_schedule({
-            'schedule_type': schedule['type'],
-            'schedule_time': schedule['time'],
-            'schedule_day': schedule['day'],
-            'schedule_date': schedule['date']
-        }), inline=False)
+        embed.add_field(name="📅 Schedule", value=self.category_manager.format_schedule(schedule), inline=False)
         embed.add_field(name="📍 Channel", value=channel.mention, inline=False)
         
         if min_temp:
@@ -720,33 +1132,11 @@ class PepperCommands(commands.Cog):
             )
             return
         
-        embed = discord.Embed(
-            title="📋 Active Categories",
-            description=f"Managing {len(categories)} automated notifications",
-            color=Config.COLOR_PRIMARY
-        )
+        embed = self._build_category_list_embed(categories)
         
-        for i, cat in enumerate(categories, 1):
-            emoji = self.category_manager.get_category_emoji(cat['slug'])
-            
-            filters = []
-            if cat.get('min_temperature', 0) > 0:
-                filters.append(f"🌡️ Min: {cat['min_temperature']}°")
-            if cat.get('max_price'):
-                filters.append(f"💰 Max: {cat['max_price']} zł")
-            
-            filter_str = " | ".join(filters) if filters else "No filters"
-            
-            schedule_str = self.category_manager.format_schedule(cat)
-            status_emoji = "✅" if cat['status'] == 'active' else "⏸️"
-            
-            value = f"{status_emoji} {schedule_str}\n📍 <#{cat['channel_id']}>\n{filter_str}"
-            
-            name = f"{i}. {emoji} {cat['slug']}"
-            if cat['slug'] == 'bilety-lotnicze':
-                name += " [PROTECTED]"
-            
-            embed.add_field(name=name, value=value, inline=False)
+        for field in embed.fields:
+            if 'bilety-lotnicze' in field.name.lower():
+                field.name += " [PROTECTED]"
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
     
@@ -851,9 +1241,7 @@ class PepperCommands(commands.Cog):
         
         for i, deal in enumerate(deals, 1):
             temp = deal.get('temperature', 0)
-            icon = '🔥' if temp > 300 else '❄️'
-            if temp > 500:
-                icon = '🌋'
+            icon = self.get_temperature_icon(temp)
             
             value = f"💰 {deal.get('price', '???')} | {icon} {temp}° | 🪐 {deal.get('merchant', 'Unknown')}"
             embed.add_field(
