@@ -25,8 +25,6 @@ class PepperBot(commands.Bot):
         self.db = Database()
 
     async def setup_hook(self):
-        """Initialize session with optimized connector, db, load cogs, and sync slash commands."""
-        
         connector = aiohttp.TCPConnector(
             limit=50,
             limit_per_host=10,
@@ -57,7 +55,6 @@ class PepperBot(commands.Bot):
         try:
             await self.load_extension("cogs.pepper")
             logger.info("Loaded extension: cogs.pepper")
-
             synced = await self.tree.sync()
             logger.info(f"Synced {len(synced)} command(s) globally.")
 
